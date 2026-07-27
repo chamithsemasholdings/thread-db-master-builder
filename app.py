@@ -419,7 +419,6 @@ with st.sidebar:
             accept_multiple_files=True,
             help="Upload one or more Thread DB Excel files.",
         )
-    process_button = st.button("🚀 Create master DB", use_container_width=True, type="primary")
 
     st.divider()
     st.markdown(
@@ -434,12 +433,58 @@ with st.sidebar:
         """
     )
 
-if process_button:
-    if input_mode == "Local folder" and not main_folder:
+if input_mode == "Upload files" and uploaded_files:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(message: str, current: int, total: int) -> None:
+        status_text.text(message)
+        if total:
+            progress_bar.progress(min(1.0, current / total))
+
+    master_db, metadata_log = build_master_db_from_files(uploaded_files, progress_callback=update_progress)
+
+    progress_bar.progress(1.0)
+    status_text.text("Completed.")
+
+    if master_db.empty:
+        st.info("No usable rows were found.")
+        st.subheader("Processing details")
+        st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
+    else:
+        output_path = Path(output_folder).expanduser() / output_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        master_db.to_excel(output_path, index=False)
+
+        st.success(f"Master DB generated with {len(master_db)} rows.")
+        st.success(f"Saved to: `{output_path}`")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Rows", len(master_db))
+        col2.metric("Columns", len(master_db.columns))
+        col3.metric(
+            "Workbook files scanned",
+            len([entry for entry in metadata_log if entry.get("status") == "ok"]),
+        )
+
+        st.subheader("Master database preview")
+        st.dataframe(master_db.head(200), use_container_width=True)
+
+        st.subheader("Processing summary")
+        summary_df = pd.DataFrame(metadata_log)
+        st.dataframe(summary_df, use_container_width=True)
+
+        with open(output_path, "rb") as fh:
+            file_bytes = fh.read()
+        st.download_button(
+            label="📥 Download master Excel",
+            data=file_bytes,
+            file_name=output_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+elif input_mode == "Local folder" and st.button("🚀 Create master DB", use_container_width=True, type="primary"):
+    if not main_folder:
         st.error("Please enter a main folder path.")
-        st.stop()
-    if input_mode == "Upload files" and not uploaded_files:
-        st.error("Please upload at least one Excel file.")
         st.stop()
 
     try:
@@ -451,10 +496,7 @@ if process_button:
             if total:
                 progress_bar.progress(min(1.0, current / total))
 
-        if input_mode == "Local folder":
-            master_db, metadata_log = build_master_db(main_folder, progress_callback=update_progress)
-        else:
-            master_db, metadata_log = build_master_db_from_files(uploaded_files, progress_callback=update_progress)
+        master_db, metadata_log = build_master_db(main_folder, progress_callback=update_progress)
     except FileNotFoundError as exc:
         st.error(str(exc))
         st.stop()
@@ -499,4 +541,7 @@ if process_button:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("👈 Choose an input mode in the sidebar and click **Create master DB** to get started.")
+    if input_mode == "Upload files":
+        st.info("👈 Upload Excel files in the sidebar to auto-build the Master DB.")
+    else:
+        st.info("👈 Enter a folder path in the sidebar and click **Create master DB** to get started.")
