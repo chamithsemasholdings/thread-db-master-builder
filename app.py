@@ -9,6 +9,7 @@ from typing import Callable, List, Union
 
 import pandas as pd
 import streamlit as st
+from streamlit.components.v1 import html as st_html
 
 
 st.set_page_config(
@@ -374,6 +375,26 @@ def export_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+FOLDER_PICKER_HTML = """
+<input type="file" id="folderPicker" webkitdirectory directory multiple style="display:none" />
+<button id="folderPickerBtn">Select Folder</button>
+<p id="folderPickerStatus">No folder selected</p>
+<script>
+(function() {
+  const picker = document.getElementById('folderPicker');
+  const btn = document.getElementById('folderPickerBtn');
+  const status = document.getElementById('folderPickerStatus');
+  if (!picker || !btn) return;
+  btn.addEventListener('click', () => picker.click());
+  picker.addEventListener('change', () => {
+    const files = Array.from(picker.files || []);
+    status.textContent = files.length ? 'Selected ' + files.length + ' file(s)' : 'No folder selected';
+  });
+})();
+</script>
+"""
+
+
 st.title("🧵 Thread DB Master Builder")
 st.markdown(
     """
@@ -415,12 +436,14 @@ with st.sidebar:
             help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
         )
     elif input_mode == "Upload folder":
-        folder_files = st.file_uploader(
-            "Upload folder",
+        st.info("Use the file picker below and select a folder. On Chrome/Edge you can select the whole folder directly.")
+        uploaded_files = st.file_uploader(
+            "Upload folder files",
             type=["xlsx", "xlsm", "xls"],
             accept_multiple_files=True,
-            help="Select a folder from your computer. All nested Excel files will be processed.",
+            help="Select all Excel files in your Thread DB folder. You can use Ctrl+A inside the file picker.",
         )
+        st_html(FOLDER_PICKER_HTML, height=60)
     else:
         uploaded_files = st.file_uploader(
             "Upload Excel files",
@@ -442,7 +465,7 @@ with st.sidebar:
         """
     )
 
-if input_mode == "Upload folder" and folder_files:
+if input_mode == "Upload folder" and uploaded_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -451,7 +474,7 @@ if input_mode == "Upload folder" and folder_files:
         if total:
             progress_bar.progress(min(1.0, current / total))
 
-    master_db, metadata_log = build_master_db_from_files(folder_files, progress_callback=update_progress)
+    master_db, metadata_log = build_master_db_from_files(uploaded_files, progress_callback=update_progress)
 
     progress_bar.progress(1.0)
     status_text.text("Completed.")
