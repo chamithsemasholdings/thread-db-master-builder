@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+import zipfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -9,7 +10,6 @@ from typing import Callable, List, Union
 
 import pandas as pd
 import streamlit as st
-from streamlit.components.v1 import html as st_html
 
 
 st.set_page_config(
@@ -343,6 +343,102 @@ def build_master_db_from_files(
     return _combine_frames(collected_frames, metadata_log)
 
 
+def _collect_excel_files_from_dir(root_dir: Path) -> List[Path]:
+    return sorted([p for p in root_dir.rglob("*.xlsx") if p.is_file()])
+
+
+def build_master_db_from_zip(
+    zip_uploaded,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    collected_frames: list[pd.DataFrame] = []
+    metadata_log: list[dict] = []
+    extract_root = Path(tempfile.gettempdir()) / "thread_db_zip"
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    zip_bytes = zip_uploaded.read() if hasattr(zip_uploaded, "read") else zip_uploaded.getvalue()
+    zip_name = getattr(zip_uploaded, "name", "uploaded.zip")
+    zip_path = extract_root / zip_name
+    zip_path.write_bytes(zip_bytes)
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_root)
+    except Exception as exc:
+        metadata_log.append({
+            "file": zip_name,
+            "status": "error",
+            "message": f"Failed to extract ZIP: {exc}",
+        })
+        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    workbook_files = _collect_excel_files_from_dir(extract_root)
+    if not workbook_files:
+        metadata_log.append({
+            "file": zip_name,
+            "status": "empty",
+            "message": "No Excel files found in the uploaded ZIP.",
+        })
+        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    if progress_callback is not None:
+        progress_callback("Scanning Excel files from uploaded ZIP…", 0, max(1, len(workbook_files)))
+
+    root = extract_root
+    for index, file_path in enumerate(workbook_files, start=1):
+        if progress_callback is not None:
+            progress_callback(f"Reading {file_path.name}", index, max(1, len(workbook_files)))
+
+        try:
+            workbook = pd.ExcelFile(file_path)
+        except Exception as exc:
+            metadata_log.append({
+                "file": str(file_path),
+                "status": "error",
+                "message": str(exc),
+            })
+            continue
+
+        sheet_names = [sheet for sheet in workbook.sheet_names if isinstance(sheet, str) and sheet.strip()]
+        preferred_sheets = []
+        if "Thread_DB" in sheet_names:
+            preferred_sheets.append("Thread_DB")
+        preferred_sheets.extend([sheet for sheet in sheet_names if sheet != "Thread_DB"])
+        if not preferred_sheets and sheet_names:
+            preferred_sheets = sheet_names
+        elif not preferred_sheets:
+            preferred_sheets = [workbook.sheet_names[0]] if workbook.sheet_names else []
+
+        for sheet_name in preferred_sheets:
+            try:
+                df = read_sheet_dataframe(file_path, sheet_name)
+            except Exception as exc:
+                metadata_log.append({
+                    "file": str(file_path),
+                    "sheet": sheet_name,
+                    "status": "error",
+                    "message": str(exc),
+                })
+                continue
+
+            if df.empty:
+                metadata_log.append({
+                    "file": str(file_path),
+                    "sheet": sheet_name,
+                    "status": "empty",
+                    "rows": 0,
+                    "columns": [],
+                })
+                continue
+
+            _process_frame(df, file_path, root, collected_frames, metadata_log)
+
+    if progress_callback is not None:
+        progress_callback("Combining rows into one master table…", len(workbook_files), max(1, len(workbook_files)))
+
+    return _combine_frames(collected_frames, metadata_log)
+
+
 def _combine_frames(collected_frames: list[pd.DataFrame], metadata_log: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
     if not collected_frames:
         return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
@@ -375,32 +471,13 @@ def export_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-FOLDER_PICKER_HTML = """
-<input type="file" id="folderPicker" webkitdirectory directory multiple style="display:none" />
-<button id="folderPickerBtn">Select Folder</button>
-<p id="folderPickerStatus">No folder selected</p>
-<script>
-(function() {
-  const picker = document.getElementById('folderPicker');
-  const btn = document.getElementById('folderPickerBtn');
-  const status = document.getElementById('folderPickerStatus');
-  if (!picker || !btn) return;
-  btn.addEventListener('click', () => picker.click());
-  picker.addEventListener('change', () => {
-    const files = Array.from(picker.files || []);
-    status.textContent = files.length ? 'Selected ' + files.length + ' file(s)' : 'No folder selected';
-  });
-})();
-</script>
-"""
-
-
 st.title("🧵 Thread DB Master Builder")
 st.markdown(
     """
     Build one **Master DB** from Thread DB Excel files. Use either:
     - **Local folder mode**: point the app at a folder on this machine
     - **Upload folder**: select a folder directly — works on **Streamlit Cloud**
+    - **Upload ZIP**: upload a ZIP of your folder tree
     - **Upload files**: upload Excel files directly
     """
 )
@@ -422,12 +499,13 @@ with st.sidebar:
     st.subheader("Input mode")
     input_mode = st.radio(
         "Source",
-        options=["Local folder", "Upload folder", "Upload files"],
-        help="Choose Local folder for desktop, Upload folder to select a folder directly, or Upload files for direct Excel uploads.",
+        options=["Local folder", "Upload folder", "Upload ZIP", "Upload files"],
+        help="Choose Local folder for desktop, Upload folder to select a folder directly, Upload ZIP to upload a zipped folder, or Upload files for direct Excel uploads.",
     )
     main_folder = ""
     uploaded_files = []
     folder_files: List[st.runtime.uploaded_file_manager.UploadedFile] = []
+    zip_file = None
     if input_mode == "Local folder":
         default_root = str(Path.cwd())
         main_folder = st.text_input(
@@ -436,14 +514,19 @@ with st.sidebar:
             help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
         )
     elif input_mode == "Upload folder":
-        st.info("Use the file picker below and select a folder. On Chrome/Edge you can select the whole folder directly.")
+        st.info("Select all Excel files in your Thread DB folder using the picker below. On Windows you can select multiple files with Ctrl+Click or Ctrl+A.")
         folder_files = st.file_uploader(
             "Upload folder files",
             type=["xlsx", "xlsm", "xls"],
             accept_multiple_files=True,
-            help="Select all Excel files in your Thread DB folder. You can use Ctrl+A inside the file picker.",
+            help="Select all Excel files in your Thread DB folder.",
         )
-        st_html(FOLDER_PICKER_HTML, height=60)
+    elif input_mode == "Upload ZIP":
+        zip_file = st.file_uploader(
+            "Upload folder ZIP",
+            type=["zip"],
+            help="Zip your Thread DB folder and upload it here.",
+        )
     else:
         uploaded_files = st.file_uploader(
             "Upload Excel files",
@@ -465,7 +548,7 @@ with st.sidebar:
         """
     )
 
-if input_mode == "Upload folder" and uploaded_files:
+if input_mode == "Upload folder" and folder_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
