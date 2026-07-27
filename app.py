@@ -437,7 +437,7 @@ with st.sidebar:
         )
     elif input_mode == "Upload folder":
         st.info("Use the file picker below and select a folder. On Chrome/Edge you can select the whole folder directly.")
-        uploaded_files = st.file_uploader(
+        folder_files = st.file_uploader(
             "Upload folder files",
             type=["xlsx", "xlsm", "xls"],
             accept_multiple_files=True,
