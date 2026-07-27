@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Union
 
 import pandas as pd
 import streamlit as st
@@ -81,7 +82,7 @@ def clean_cell(value: object) -> str:
 GRAND_TOTAL_TOKENS = {"grand total", "total", "subtotal"}
 
 
-def read_sheet_dataframe(file_path: Path, sheet_name: str) -> pd.DataFrame:
+def read_sheet_dataframe(file_path: Union[Path, BytesIO], sheet_name: str) -> pd.DataFrame:
     try:
         raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=str)
     except Exception:
@@ -156,6 +157,54 @@ def read_sheet_dataframe(file_path: Path, sheet_name: str) -> pd.DataFrame:
     return data
 
 
+def _process_frame(
+    df: pd.DataFrame,
+    file_path: Path,
+    root: Path,
+    collected_frames: list[pd.DataFrame],
+    metadata_log: list[dict],
+) -> None:
+    mapping = normalize_headers(df.columns.tolist())
+    renamed_columns = []
+    seen: dict[str, int] = {}
+    for original_name in df.columns.tolist():
+        canonical_name = mapping.get(original_name, original_name)
+        if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
+            canonical_name = canonical_name
+        count = seen.get(canonical_name, 0)
+        if count:
+            renamed_columns.append(f"{canonical_name}_{count + 1}")
+        else:
+            renamed_columns.append(canonical_name)
+        seen[canonical_name] = count + 1
+
+    df = df.copy()
+    df.columns = renamed_columns
+
+    for essential_col in ESSENTIAL_COLUMNS:
+        variants = [c for c in df.columns if c == essential_col]
+        variants += [c for c in df.columns if c.startswith(f"{essential_col}_")]
+        if len(variants) > 1:
+            merged = df[variants[0]]
+            for var in variants[1:]:
+                merged = merged.where(merged.notna() & merged.ne(""), df[var])
+            df[essential_col] = merged
+            df = df.drop(columns=variants[1:])
+
+    df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
+    df["Source File"] = file_path.name
+    df["Source Sheet"] = file_path.name
+    df["Source Row Count"] = len(df)
+    collected_frames.append(df)
+    metadata_log.append({
+        "file": str(file_path),
+        "sheet": "all",
+        "status": "ok",
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+    })
+
+
 def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int], None] | None = None) -> tuple[pd.DataFrame, list[dict]]:
     root = Path(main_folder).expanduser()
     if not root.exists():
@@ -214,62 +263,88 @@ def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int
                 })
                 continue
 
-            mapping = normalize_headers(df.columns.tolist())
-            renamed_columns = []
-            seen: dict[str, int] = {}
-            for original_name in df.columns.tolist():
-                canonical_name = mapping.get(original_name, original_name)
-                if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
-                    canonical_name = canonical_name
-                count = seen.get(canonical_name, 0)
-                if count:
-                    renamed_columns.append(f"{canonical_name}_{count + 1}")
-                else:
-                    renamed_columns.append(canonical_name)
-                seen[canonical_name] = count + 1
-
-            df = df.copy()
-            df.columns = renamed_columns
-
-            for essential_col in ESSENTIAL_COLUMNS:
-                variants = [c for c in df.columns if c == essential_col]
-                variants += [c for c in df.columns if c.startswith(f"{essential_col}_")]
-                if len(variants) > 1:
-                    merged = df[variants[0]]
-                    for var in variants[1:]:
-                        merged = merged.where(merged.notna() & merged.ne(""), df[var])
-                    df[essential_col] = merged
-                    df = df.drop(columns=variants[1:])
-
-            df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
-            df["Source File"] = file_path.name
-            df["Source Sheet"] = sheet_name
-            df["Source Row Count"] = len(df)
-            collected_frames.append(df)
-            metadata_log.append({
-                "file": str(file_path),
-                "sheet": sheet_name,
-                "status": "ok",
-                "rows": len(df),
-                "columns": df.columns.tolist(),
-            })
+            _process_frame(df, file_path, root, collected_frames, metadata_log)
 
     if progress_callback is not None:
         progress_callback("Combining rows into one master table…", len(workbook_files), max(1, len(workbook_files)))
 
+    return _combine_frames(collected_frames, metadata_log)
+
+
+def build_master_db_from_files(
+    uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    collected_frames: list[pd.DataFrame] = []
+    metadata_log: list[dict] = []
+    temp_dir = Path(tempfile.gettempdir()) / "thread_db_uploads"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    if progress_callback is not None:
+        progress_callback("Processing uploaded files…", 0, max(1, len(uploaded_files)))
+
+    for index, uploaded in enumerate(uploaded_files, start=1):
+        if progress_callback is not None:
+            progress_callback(f"Reading {uploaded.name}", index, max(1, len(uploaded_files)))
+
+        safe_name = re.sub(r'[^A-Za-z0-9_\-\.]+', '_', uploaded.name)
+        temp_path = temp_dir / safe_name
+        temp_path.write_bytes(uploaded.read())
+        file_path = Path(temp_path)
+
+        try:
+            workbook = pd.ExcelFile(file_path)
+        except Exception as exc:
+            metadata_log.append({
+                "file": uploaded.name,
+                "status": "error",
+                "message": str(exc),
+            })
+            continue
+
+        sheet_names = [sheet for sheet in workbook.sheet_names if isinstance(sheet, str) and sheet.strip()]
+        preferred_sheets = []
+        if "Thread_DB" in sheet_names:
+            preferred_sheets.append("Thread_DB")
+        preferred_sheets.extend([sheet for sheet in sheet_names if sheet != "Thread_DB"])
+        if not preferred_sheets and sheet_names:
+            preferred_sheets = sheet_names
+        elif not preferred_sheets:
+            preferred_sheets = [workbook.sheet_names[0]] if workbook.sheet_names else []
+
+        for sheet_name in preferred_sheets:
+            try:
+                df = read_sheet_dataframe(file_path, sheet_name)
+            except Exception as exc:
+                metadata_log.append({
+                    "file": uploaded.name,
+                    "sheet": sheet_name,
+                    "status": "error",
+                    "message": str(exc),
+                })
+                continue
+
+            if df.empty:
+                metadata_log.append({
+                    "file": uploaded.name,
+                    "sheet": sheet_name,
+                    "status": "empty",
+                    "rows": 0,
+                    "columns": [],
+                })
+                continue
+
+            _process_frame(df, file_path, file_path.parent, collected_frames, metadata_log)
+
+    if progress_callback is not None:
+        progress_callback("Combining rows into one master table…", len(uploaded_files), max(1, len(uploaded_files)))
+
+    return _combine_frames(collected_frames, metadata_log)
+
+
+def _combine_frames(collected_frames: list[pd.DataFrame], metadata_log: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
     if not collected_frames:
         return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
-
-    all_columns = set()
-    for frame in collected_frames:
-        all_columns.update(frame.columns.tolist())
-
-    other_columns = [col for col in sorted(all_columns) if col not in ESSENTIAL_COLUMNS]
-    master_columns = [col for col in ESSENTIAL_COLUMNS if col in all_columns] + other_columns
-
-    for col in ESSENTIAL_COLUMNS:
-        if col not in all_columns:
-            all_columns.add(col)
 
     combined_rows: list[pd.DataFrame] = []
     for frame in collected_frames:
@@ -302,21 +377,14 @@ def export_excel_bytes(df: pd.DataFrame) -> bytes:
 st.title("🧵 Thread DB Master Builder")
 st.markdown(
     """
-    Select your **Thread DB Forecast** root folder. The app will scan all nested Excel files
-    inside sub-folders such as **FA26**, **HO26**, **SP27**, and **SU27**, read the
-    **Thread_DB** sheet (and any other sheets), normalize the columns, and combine everything
-    into a single **Master DB** Excel file.
+    Build one **Master DB** from Thread DB Excel files. Use either:
+    - **Local folder mode**: point the app at a folder on this machine
+    - **Upload mode**: upload Excel files directly — works on **Streamlit Cloud**
     """
 )
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    default_root = str(Path.cwd())
-    main_folder = st.text_input(
-        "Main folder path",
-        value=default_root,
-        help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
-    )
     today_str = datetime.now().strftime("%Y-%m-%d")
     output_name = st.text_input(
         "Output Excel file name",
@@ -328,6 +396,29 @@ with st.sidebar:
         value=str(Path.cwd()),
         help="Full path where the master Excel file will be written.",
     )
+    st.divider()
+    st.subheader("Input mode")
+    input_mode = st.radio(
+        "Source",
+        options=["Local folder", "Upload files"],
+        help="Choose Local folder for desktop use, or Upload files for Streamlit Cloud.",
+    )
+    main_folder = ""
+    uploaded_files = []
+    if input_mode == "Local folder":
+        default_root = str(Path.cwd())
+        main_folder = st.text_input(
+            "Main folder path",
+            value=default_root,
+            help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
+        )
+    else:
+        uploaded_files = st.file_uploader(
+            "Upload Excel files",
+            type=["xlsx", "xlsm", "xls"],
+            accept_multiple_files=True,
+            help="Upload one or more Thread DB Excel files.",
+        )
     process_button = st.button("🚀 Create master DB", use_container_width=True, type="primary")
 
     st.divider()
@@ -344,6 +435,13 @@ with st.sidebar:
     )
 
 if process_button:
+    if input_mode == "Local folder" and not main_folder:
+        st.error("Please enter a main folder path.")
+        st.stop()
+    if input_mode == "Upload files" and not uploaded_files:
+        st.error("Please upload at least one Excel file.")
+        st.stop()
+
     try:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -353,7 +451,10 @@ if process_button:
             if total:
                 progress_bar.progress(min(1.0, current / total))
 
-        master_db, metadata_log = build_master_db(main_folder, progress_callback=update_progress)
+        if input_mode == "Local folder":
+            master_db, metadata_log = build_master_db(main_folder, progress_callback=update_progress)
+        else:
+            master_db, metadata_log = build_master_db_from_files(uploaded_files, progress_callback=update_progress)
     except FileNotFoundError as exc:
         st.error(str(exc))
         st.stop()
@@ -363,7 +464,7 @@ if process_button:
     st.success("Master workbook generated successfully.")
 
     if master_db.empty:
-        st.info("No usable rows were found in the selected folder.")
+        st.info("No usable rows were found.")
         st.subheader("Processing details")
         st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
         st.stop()
@@ -398,4 +499,4 @@ if process_button:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("👈 Choose the main folder in the sidebar and click **Create master DB** to get started.")
+    st.info("👈 Choose an input mode in the sidebar and click **Create master DB** to get started.")
