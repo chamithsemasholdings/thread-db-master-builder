@@ -16,17 +16,18 @@ git push -u origin main
    `app.py`
 4. Click **"Deploy"**.
 
-## 3. Configure Secrets (Optional)
+## 3. Using the App
 
-If you need to set a default folder or API keys, use Streamlit Cloud **Settings > Secrets**:
+### Local Mode
+- Select **Local folder** in the sidebar.
+- Enter the path to your Thread DB folder.
+- Click **Create master DB**.
 
-```toml
-[main_folder]
-path = "/mount/src/thread-db-master-builder/THREAD DB FOR FORECAST"
-```
-
-> Note: Streamlit Cloud runs in a Linux container. Use Linux-style paths.
-> The app currently reads from a local folder path entered in the sidebar.
+### Upload Mode (Streamlit Cloud)
+- Select **Upload files** in the sidebar.
+- Upload one or more Excel files.
+- Click **Create master DB**.
+- Download the generated master Excel.
 
 ## 4. File Structure
 
@@ -49,4 +50,5 @@ python -m streamlit run app.py --server.port 8503 --server.headless true
 
 - **Do not** commit Excel files or data folders; `.gitignore` excludes `*.xlsx`.
 - Streamlit Cloud free tier has 1 GB RAM and sleeps after inactivity.
-- For large datasets, consider adding a file uploader widget instead of folder scanning.
+- Upload mode processes files in-memory/temp storage, so it works on Streamlit Cloud without local folder access.
+- For large datasets, consider splitting uploads into smaller batches.
