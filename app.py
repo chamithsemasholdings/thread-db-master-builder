@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+import zipfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -271,6 +272,102 @@ def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int
     return _combine_frames(collected_frames, metadata_log)
 
 
+def _collect_excel_files_from_dir(root_dir: Path) -> List[Path]:
+    return sorted([p for p in root_dir.rglob("*.xlsx") if p.is_file()])
+
+
+def build_master_db_from_zip(
+    zip_uploaded,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    collected_frames: list[pd.DataFrame] = []
+    metadata_log: list[dict] = []
+    extract_root = Path(tempfile.gettempdir()) / "thread_db_zip"
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    zip_bytes = zip_uploaded.read() if hasattr(zip_uploaded, "read") else zip_uploaded.getvalue()
+    zip_name = getattr(zip_uploaded, "name", "uploaded.zip")
+    zip_path = extract_root / zip_name
+    zip_path.write_bytes(zip_bytes)
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_root)
+    except Exception as exc:
+        metadata_log.append({
+            "file": zip_name,
+            "status": "error",
+            "message": f"Failed to extract ZIP: {exc}",
+        })
+        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    workbook_files = _collect_excel_files_from_dir(extract_root)
+    if not workbook_files:
+        metadata_log.append({
+            "file": zip_name,
+            "status": "empty",
+            "message": "No Excel files found in the uploaded ZIP.",
+        })
+        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    if progress_callback is not None:
+        progress_callback("Scanning Excel files from uploaded ZIP…", 0, max(1, len(workbook_files)))
+
+    root = extract_root
+    for index, file_path in enumerate(workbook_files, start=1):
+        if progress_callback is not None:
+            progress_callback(f"Reading {file_path.name}", index, max(1, len(workbook_files)))
+
+        try:
+            workbook = pd.ExcelFile(file_path)
+        except Exception as exc:
+            metadata_log.append({
+                "file": str(file_path),
+                "status": "error",
+                "message": str(exc),
+            })
+            continue
+
+        sheet_names = [sheet for sheet in workbook.sheet_names if isinstance(sheet, str) and sheet.strip()]
+        preferred_sheets = []
+        if "Thread_DB" in sheet_names:
+            preferred_sheets.append("Thread_DB")
+        preferred_sheets.extend([sheet for sheet in sheet_names if sheet != "Thread_DB"])
+        if not preferred_sheets and sheet_names:
+            preferred_sheets = sheet_names
+        elif not preferred_sheets:
+            preferred_sheets = [workbook.sheet_names[0]] if workbook.sheet_names else []
+
+        for sheet_name in preferred_sheets:
+            try:
+                df = read_sheet_dataframe(file_path, sheet_name)
+            except Exception as exc:
+                metadata_log.append({
+                    "file": str(file_path),
+                    "sheet": sheet_name,
+                    "status": "error",
+                    "message": str(exc),
+                })
+                continue
+
+            if df.empty:
+                metadata_log.append({
+                    "file": str(file_path),
+                    "sheet": sheet_name,
+                    "status": "empty",
+                    "rows": 0,
+                    "columns": [],
+                })
+                continue
+
+            _process_frame(df, file_path, root, collected_frames, metadata_log)
+
+    if progress_callback is not None:
+        progress_callback("Combining rows into one master table…", len(workbook_files), max(1, len(workbook_files)))
+
+    return _combine_frames(collected_frames, metadata_log)
+
+
 def build_master_db_from_files(
     uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
     progress_callback: Callable[[str, int, int], None] | None = None,
@@ -379,7 +476,8 @@ st.markdown(
     """
     Build one **Master DB** from Thread DB Excel files. Use either:
     - **Local folder mode**: point the app at a folder on this machine
-    - **Upload mode**: upload Excel files directly — works on **Streamlit Cloud**
+    - **Upload ZIP folder**: upload a ZIP of your folder tree — works on **Streamlit Cloud**
+    - **Upload files**: upload Excel files directly
     """
 )
 
@@ -400,17 +498,24 @@ with st.sidebar:
     st.subheader("Input mode")
     input_mode = st.radio(
         "Source",
-        options=["Local folder", "Upload files"],
-        help="Choose Local folder for desktop use, or Upload files for Streamlit Cloud.",
+        options=["Local folder", "Upload ZIP folder", "Upload files"],
+        help="Choose Local folder for desktop, Upload ZIP folder to upload an entire folder, or Upload files for direct Excel uploads.",
     )
     main_folder = ""
     uploaded_files = []
+    zip_file = None
     if input_mode == "Local folder":
         default_root = str(Path.cwd())
         main_folder = st.text_input(
             "Main folder path",
             value=default_root,
             help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
+        )
+    elif input_mode == "Upload ZIP folder":
+        zip_file = st.file_uploader(
+            "Upload folder ZIP",
+            type=["zip"],
+            help="Zip your Thread DB folder and upload it here.",
         )
     else:
         uploaded_files = st.file_uploader(
@@ -433,7 +538,56 @@ with st.sidebar:
         """
     )
 
-if input_mode == "Upload files" and uploaded_files:
+if input_mode == "Upload ZIP folder" and zip_file is not None:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(message: str, current: int, total: int) -> None:
+        status_text.text(message)
+        if total:
+            progress_bar.progress(min(1.0, current / total))
+
+    master_db, metadata_log = build_master_db_from_zip(zip_file, progress_callback=update_progress)
+
+    progress_bar.progress(1.0)
+    status_text.text("Completed.")
+
+    if master_db.empty:
+        st.info("No usable rows were found.")
+        st.subheader("Processing details")
+        st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
+    else:
+        output_path = Path(output_folder).expanduser() / output_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        master_db.to_excel(output_path, index=False)
+
+        st.success(f"Master DB generated with {len(master_db)} rows.")
+        st.success(f"Saved to: `{output_path}`")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Rows", len(master_db))
+        col2.metric("Columns", len(master_db.columns))
+        col3.metric(
+            "Workbook files scanned",
+            len([entry for entry in metadata_log if entry.get("status") == "ok"]),
+        )
+
+        st.subheader("Master database preview")
+        st.dataframe(master_db.head(200), use_container_width=True)
+
+        st.subheader("Processing summary")
+        summary_df = pd.DataFrame(metadata_log)
+        st.dataframe(summary_df, use_container_width=True)
+
+        with open(output_path, "rb") as fh:
+            file_bytes = fh.read()
+        st.download_button(
+            label="📥 Download master Excel",
+            data=file_bytes,
+            file_name=output_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+elif input_mode == "Upload files" and uploaded_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -541,7 +695,9 @@ elif input_mode == "Local folder" and st.button("🚀 Create master DB", use_con
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    if input_mode == "Upload files":
+    if input_mode == "Upload ZIP folder":
+        st.info("👈 Upload a ZIP of your Thread DB folder to auto-build the Master DB.")
+    elif input_mode == "Upload files":
         st.info("👈 Upload Excel files in the sidebar to auto-build the Master DB.")
     else:
         st.info("👈 Enter a folder path in the sidebar and click **Create master DB** to get started.")
