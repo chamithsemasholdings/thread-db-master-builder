@@ -166,9 +166,20 @@ def _process_frame(
     metadata_log: list[dict],
 ) -> None:
     mapping = normalize_headers(df.columns.tolist())
+    original_names = df.columns.tolist()
+
+    def _sort_key(name: str) -> tuple[int, str]:
+        canonical = mapping.get(name, name)
+        name_norm = normalize_text(name)
+        canonical_norm = normalize_text(canonical)
+        if name_norm == canonical_norm:
+            return (0, name)
+        return (1, name)
+
+    sorted_originals = sorted(original_names, key=_sort_key)
     renamed_columns = []
     seen: dict[str, int] = {}
-    for original_name in df.columns.tolist():
+    for original_name in sorted_originals:
         canonical_name = mapping.get(original_name, original_name)
         if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
             canonical_name = canonical_name
