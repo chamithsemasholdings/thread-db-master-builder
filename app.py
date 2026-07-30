@@ -40,7 +40,6 @@ def normalize_headers(columns: List[object]) -> dict:
     alias_map = {
         "season": "Season",
         "style cw": "Style-CW",
-        "style": "Style-CW",
         "thread color": "Thread-Color",
         "threadcolour": "Thread-Color",
         "thread": "Thread-Color",
@@ -168,18 +167,13 @@ def _process_frame(
     mapping = normalize_headers(df.columns.tolist())
     original_names = df.columns.tolist()
 
-    def _sort_key(name: str) -> tuple[int, str]:
-        canonical = mapping.get(name, name)
-        name_norm = normalize_text(name)
-        canonical_norm = normalize_text(canonical)
-        if name_norm == canonical_norm:
-            return (0, name)
-        return (1, name)
+    if "Style-CW" in original_names and "Style" in original_names:
+        df = df.drop(columns=["Style"])
+        original_names = [c for c in df.columns.tolist() if c in df.columns]
 
-    sorted_originals = sorted(original_names, key=_sort_key)
     renamed_columns = []
     seen: dict[str, int] = {}
-    for original_name in sorted_originals:
+    for original_name in df.columns.tolist():
         canonical_name = mapping.get(original_name, original_name)
         if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
             canonical_name = canonical_name
@@ -202,6 +196,15 @@ def _process_frame(
                 merged = merged.where(merged.notna() & merged.ne(""), df[var])
             df[essential_col] = merged
             df = df.drop(columns=variants[1:])
+
+    if "Style-CW" not in df.columns:
+        style_cols = [c for c in df.columns if c == "Style"]
+        cw_cols = [c for c in df.columns if c == "CW"]
+        if style_cols and cw_cols:
+            df["Style-CW"] = df[style_cols[0]].astype(str).str.strip() + "-" + df[cw_cols[0]].astype(str).str.strip()
+            df = df.drop(columns=style_cols + cw_cols)
+        elif style_cols:
+            df = df.rename(columns={style_cols[0]: "Style-CW"})
 
     df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
     df["Source File"] = file_path.name
