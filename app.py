@@ -302,6 +302,9 @@ def _process_frame(
     collected_frames: list[pd.DataFrame],
     metadata_log: list[dict],
 ) -> None:
+    if "Style-CW" in df.columns and "Style" in df.columns:
+        df = df.drop(columns=["Style"])
+
     mapping = normalize_headers(df.columns.tolist())
     renamed_columns = []
     seen: dict[str, int] = {}
