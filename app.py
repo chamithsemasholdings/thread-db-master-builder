@@ -225,7 +225,10 @@ def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int
     if not root.exists():
         raise FileNotFoundError(f"Folder not found: {root}")
 
-    workbook_files = sorted([p for p in root.rglob("*.xlsx") if p.is_file()])
+    workbook_files = sorted([
+        p for p in root.rglob("*.xlsx")
+        if p.is_file() and not p.name.startswith("master_thread_db")
+    ])
     collected_frames: list[pd.DataFrame] = []
     metadata_log: list[dict] = []
 
