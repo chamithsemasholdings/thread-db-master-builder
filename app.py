@@ -297,6 +297,54 @@ def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int
     return master_db, metadata_log
 
 
+def _process_frame(
+    df: pd.DataFrame,
+    file_path: Path,
+    root: Path,
+    collected_frames: list[pd.DataFrame],
+    metadata_log: list[dict],
+) -> None:
+    mapping = normalize_headers(df.columns.tolist())
+    renamed_columns = []
+    seen: dict[str, int] = {}
+    for original_name in df.columns.tolist():
+        canonical_name = mapping.get(original_name, original_name)
+        if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
+            canonical_name = canonical_name
+        count = seen.get(canonical_name, 0)
+        if count:
+            renamed_columns.append(f"{canonical_name}_{count + 1}")
+        else:
+            renamed_columns.append(canonical_name)
+        seen[canonical_name] = count + 1
+
+    df = df.copy()
+    df.columns = renamed_columns
+
+    for essential_col in ESSENTIAL_COLUMNS:
+        variants = [c for c in df.columns if c == essential_col]
+        variants += [c for c in df.columns if c.startswith(f"{essential_col}_")]
+        if len(variants) > 1:
+            merged = df[variants[0]]
+            for var in variants[1:]:
+                merged = merged.where(merged.notna() & merged.ne(""), df[var])
+            df[essential_col] = merged
+            df = df.drop(columns=variants[1:])
+
+    df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
+    df["Source File"] = file_path.name
+    df["Source Sheet"] = file_path.name
+    df["Source Row Count"] = len(df)
+    collected_frames.append(df)
+    metadata_log.append({
+        "file": str(file_path),
+        "sheet": "all",
+        "status": "ok",
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+    })
+
+
 def _collect_excel_files_from_dir(root_dir: Path) -> List[Path]:
     return sorted([p for p in root_dir.rglob("*.xlsx") if p.is_file()])
 
