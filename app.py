@@ -441,6 +441,31 @@ def build_master_db_from_zip(
     return _combine_frames(collected_frames, metadata_log)
 
 
+def _combine_frames(collected_frames: list[pd.DataFrame], metadata_log: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
+    if not collected_frames:
+        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    combined_rows: list[pd.DataFrame] = []
+    for frame in collected_frames:
+        frame_copy = frame.copy()
+        for col in ESSENTIAL_COLUMNS:
+            if col not in frame_copy.columns:
+                frame_copy[col] = ""
+        if "Consumption in CO" in frame_copy.columns:
+            frame_copy["Consumption in CO"] = frame_copy["Consumption in CO"].fillna("")
+            for col in [c for c in frame_copy.columns if c.startswith("Consumption in CO") and c != "Consumption in CO"]:
+                frame_copy["Consumption in CO"] = frame_copy["Consumption in CO"].fillna(frame_copy[col])
+                frame_copy.drop(columns=[col], inplace=True)
+        keep_cols = [c for c in ESSENTIAL_COLUMNS if c in frame_copy.columns]
+        essential_df = frame_copy[keep_cols]
+        essential_df = essential_df.loc[~(essential_df.apply(lambda row: not any(str(v).strip() for v in row), axis=1))].copy()
+        combined_rows.append(essential_df)
+
+    master_db = pd.concat(combined_rows, ignore_index=True)
+    master_db = master_db.drop_duplicates(subset=ESSENTIAL_COLUMNS, keep="first").reset_index(drop=True)
+    return master_db, metadata_log
+
+
 def build_master_db_from_files(
     uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
     progress_callback: Callable[[str, int, int], None] | None = None,
