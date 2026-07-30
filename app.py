@@ -1,12 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
-import tempfile
-import zipfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, List, Union
+from typing import Callable, List
 
 import pandas as pd
 import streamlit as st
@@ -40,6 +38,7 @@ def normalize_headers(columns: List[object]) -> dict:
     alias_map = {
         "season": "Season",
         "style cw": "Style-CW",
+        "style": "Style-CW",
         "thread color": "Thread-Color",
         "threadcolour": "Thread-Color",
         "thread": "Thread-Color",
@@ -82,7 +81,7 @@ def clean_cell(value: object) -> str:
 GRAND_TOTAL_TOKENS = {"grand total", "total", "subtotal"}
 
 
-def read_sheet_dataframe(file_path: Union[Path, BytesIO], sheet_name: str) -> pd.DataFrame:
+def read_sheet_dataframe(file_path: Path, sheet_name: str) -> pd.DataFrame:
     try:
         raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=str)
     except Exception:
@@ -157,69 +156,6 @@ def read_sheet_dataframe(file_path: Union[Path, BytesIO], sheet_name: str) -> pd
     return data
 
 
-def _process_frame(
-    df: pd.DataFrame,
-    file_path: Path,
-    root: Path,
-    collected_frames: list[pd.DataFrame],
-    metadata_log: list[dict],
-) -> None:
-    mapping = normalize_headers(df.columns.tolist())
-    original_names = df.columns.tolist()
-
-    if "Style-CW" in original_names and "Style" in original_names:
-        df = df.drop(columns=["Style"])
-        original_names = [c for c in df.columns.tolist() if c in df.columns]
-
-    renamed_columns = []
-    seen: dict[str, int] = {}
-    for original_name in df.columns.tolist():
-        canonical_name = mapping.get(original_name, original_name)
-        if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
-            canonical_name = canonical_name
-        count = seen.get(canonical_name, 0)
-        if count:
-            renamed_columns.append(f"{canonical_name}_{count + 1}")
-        else:
-            renamed_columns.append(canonical_name)
-        seen[canonical_name] = count + 1
-
-    df = df.copy()
-    df.columns = renamed_columns
-
-    for essential_col in ESSENTIAL_COLUMNS:
-        variants = [c for c in df.columns if c == essential_col]
-        variants += [c for c in df.columns if c.startswith(f"{essential_col}_")]
-        if len(variants) > 1:
-            merged = df[variants[0]]
-            for var in variants[1:]:
-                merged = merged.where(merged.notna() & merged.ne(""), df[var])
-            df[essential_col] = merged
-            df = df.drop(columns=variants[1:])
-
-    if "Style-CW" not in df.columns:
-        style_cols = [c for c in df.columns if c == "Style"]
-        cw_cols = [c for c in df.columns if c == "CW"]
-        if style_cols and cw_cols:
-            df["Style-CW"] = df[style_cols[0]].astype(str).str.strip() + "-" + df[cw_cols[0]].astype(str).str.strip()
-            df = df.drop(columns=style_cols + cw_cols)
-        elif style_cols:
-            df = df.rename(columns={style_cols[0]: "Style-CW"})
-
-    df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
-    df["Source File"] = file_path.name
-    df["Source Sheet"] = file_path.name
-    df["Source Row Count"] = len(df)
-    collected_frames.append(df)
-    metadata_log.append({
-        "file": str(file_path),
-        "sheet": "all",
-        "status": "ok",
-        "rows": len(df),
-        "columns": df.columns.tolist(),
-    })
-
-
 def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int], None] | None = None) -> tuple[pd.DataFrame, list[dict]]:
     root = Path(main_folder).expanduser()
     if not root.exists():
@@ -281,184 +217,62 @@ def build_master_db(main_folder: str, progress_callback: Callable[[str, int, int
                 })
                 continue
 
-            _process_frame(df, file_path, root, collected_frames, metadata_log)
+            mapping = normalize_headers(df.columns.tolist())
+            renamed_columns = []
+            seen: dict[str, int] = {}
+            for original_name in df.columns.tolist():
+                canonical_name = mapping.get(original_name, original_name)
+                if canonical_name in {"Season", "Style-CW", "Thread-Color", "SAP Codes", "Consumption in CO"}:
+                    canonical_name = canonical_name
+                count = seen.get(canonical_name, 0)
+                if count:
+                    renamed_columns.append(f"{canonical_name}_{count + 1}")
+                else:
+                    renamed_columns.append(canonical_name)
+                seen[canonical_name] = count + 1
 
-    if progress_callback is not None:
-        progress_callback("Combining rows into one master table…", len(workbook_files), max(1, len(workbook_files)))
+            df = df.copy()
+            df.columns = renamed_columns
 
-    return _combine_frames(collected_frames, metadata_log)
+            for essential_col in ESSENTIAL_COLUMNS:
+                variants = [c for c in df.columns if c == essential_col]
+                variants += [c for c in df.columns if c.startswith(f"{essential_col}_")]
+                if len(variants) > 1:
+                    merged = df[variants[0]]
+                    for var in variants[1:]:
+                        merged = merged.where(merged.notna() & merged.ne(""), df[var])
+                    df[essential_col] = merged
+                    df = df.drop(columns=variants[1:])
 
-
-def _collect_excel_files_from_dir(root_dir: Path) -> List[Path]:
-    return sorted([p for p in root_dir.rglob("*.xlsx") if p.is_file()])
-
-
-def build_master_db_from_zip(
-    zip_uploaded,
-    progress_callback: Callable[[str, int, int], None] | None = None,
-) -> tuple[pd.DataFrame, list[dict]]:
-    collected_frames: list[pd.DataFrame] = []
-    metadata_log: list[dict] = []
-    extract_root = Path(tempfile.gettempdir()) / "thread_db_zip"
-    extract_root.mkdir(parents=True, exist_ok=True)
-
-    zip_bytes = zip_uploaded.read() if hasattr(zip_uploaded, "read") else zip_uploaded.getvalue()
-    zip_name = getattr(zip_uploaded, "name", "uploaded.zip")
-    zip_path = extract_root / zip_name
-    zip_path.write_bytes(zip_bytes)
-
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_root)
-    except Exception as exc:
-        metadata_log.append({
-            "file": zip_name,
-            "status": "error",
-            "message": f"Failed to extract ZIP: {exc}",
-        })
-        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
-
-    workbook_files = _collect_excel_files_from_dir(extract_root)
-    if not workbook_files:
-        metadata_log.append({
-            "file": zip_name,
-            "status": "empty",
-            "message": "No Excel files found in the uploaded ZIP.",
-        })
-        return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
-
-    if progress_callback is not None:
-        progress_callback("Scanning Excel files from uploaded ZIP…", 0, max(1, len(workbook_files)))
-
-    root = extract_root
-    for index, file_path in enumerate(workbook_files, start=1):
-        if progress_callback is not None:
-            progress_callback(f"Reading {file_path.name}", index, max(1, len(workbook_files)))
-
-        try:
-            workbook = pd.ExcelFile(file_path)
-        except Exception as exc:
+            df["Source Folder"] = str(file_path.parent.relative_to(root)) if file_path.parent != root else "Root"
+            df["Source File"] = file_path.name
+            df["Source Sheet"] = sheet_name
+            df["Source Row Count"] = len(df)
+            collected_frames.append(df)
             metadata_log.append({
                 "file": str(file_path),
-                "status": "error",
-                "message": str(exc),
+                "sheet": sheet_name,
+                "status": "ok",
+                "rows": len(df),
+                "columns": df.columns.tolist(),
             })
-            continue
-
-        sheet_names = [sheet for sheet in workbook.sheet_names if isinstance(sheet, str) and sheet.strip()]
-        preferred_sheets = []
-        if "Thread_DB" in sheet_names:
-            preferred_sheets.append("Thread_DB")
-        preferred_sheets.extend([sheet for sheet in sheet_names if sheet != "Thread_DB"])
-        if not preferred_sheets and sheet_names:
-            preferred_sheets = sheet_names
-        elif not preferred_sheets:
-            preferred_sheets = [workbook.sheet_names[0]] if workbook.sheet_names else []
-
-        for sheet_name in preferred_sheets:
-            try:
-                df = read_sheet_dataframe(file_path, sheet_name)
-            except Exception as exc:
-                metadata_log.append({
-                    "file": str(file_path),
-                    "sheet": sheet_name,
-                    "status": "error",
-                    "message": str(exc),
-                })
-                continue
-
-            if df.empty:
-                metadata_log.append({
-                    "file": str(file_path),
-                    "sheet": sheet_name,
-                    "status": "empty",
-                    "rows": 0,
-                    "columns": [],
-                })
-                continue
-
-            _process_frame(df, file_path, root, collected_frames, metadata_log)
 
     if progress_callback is not None:
         progress_callback("Combining rows into one master table…", len(workbook_files), max(1, len(workbook_files)))
 
-    return _combine_frames(collected_frames, metadata_log)
-
-
-def build_master_db_from_files(
-    uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
-    progress_callback: Callable[[str, int, int], None] | None = None,
-) -> tuple[pd.DataFrame, list[dict]]:
-    collected_frames: list[pd.DataFrame] = []
-    metadata_log: list[dict] = []
-    temp_dir = Path(tempfile.gettempdir()) / "thread_db_uploads"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    if progress_callback is not None:
-        progress_callback("Processing uploaded files…", 0, max(1, len(uploaded_files)))
-
-    for index, uploaded in enumerate(uploaded_files, start=1):
-        if progress_callback is not None:
-            progress_callback(f"Reading {uploaded.name}", index, max(1, len(uploaded_files)))
-
-        safe_name = re.sub(r'[^A-Za-z0-9_\-\.]+', '_', uploaded.name)
-        temp_path = temp_dir / safe_name
-        temp_path.write_bytes(uploaded.read())
-        file_path = Path(temp_path)
-
-        try:
-            workbook = pd.ExcelFile(file_path)
-        except Exception as exc:
-            metadata_log.append({
-                "file": uploaded.name,
-                "status": "error",
-                "message": str(exc),
-            })
-            continue
-
-        sheet_names = [sheet for sheet in workbook.sheet_names if isinstance(sheet, str) and sheet.strip()]
-        preferred_sheets = []
-        if "Thread_DB" in sheet_names:
-            preferred_sheets.append("Thread_DB")
-        preferred_sheets.extend([sheet for sheet in sheet_names if sheet != "Thread_DB"])
-        if not preferred_sheets and sheet_names:
-            preferred_sheets = sheet_names
-        elif not preferred_sheets:
-            preferred_sheets = [workbook.sheet_names[0]] if workbook.sheet_names else []
-
-        for sheet_name in preferred_sheets:
-            try:
-                df = read_sheet_dataframe(file_path, sheet_name)
-            except Exception as exc:
-                metadata_log.append({
-                    "file": uploaded.name,
-                    "sheet": sheet_name,
-                    "status": "error",
-                    "message": str(exc),
-                })
-                continue
-
-            if df.empty:
-                metadata_log.append({
-                    "file": uploaded.name,
-                    "sheet": sheet_name,
-                    "status": "empty",
-                    "rows": 0,
-                    "columns": [],
-                })
-                continue
-
-            _process_frame(df, file_path, file_path.parent, collected_frames, metadata_log)
-
-    if progress_callback is not None:
-        progress_callback("Combining rows into one master table…", len(uploaded_files), max(1, len(uploaded_files)))
-
-    return _combine_frames(collected_frames, metadata_log)
-
-
-def _combine_frames(collected_frames: list[pd.DataFrame], metadata_log: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
     if not collected_frames:
         return pd.DataFrame(columns=ESSENTIAL_COLUMNS), metadata_log
+
+    all_columns = set()
+    for frame in collected_frames:
+        all_columns.update(frame.columns.tolist())
+
+    other_columns = [col for col in sorted(all_columns) if col not in ESSENTIAL_COLUMNS]
+    master_columns = [col for col in ESSENTIAL_COLUMNS if col in all_columns] + other_columns
+
+    for col in ESSENTIAL_COLUMNS:
+        if col not in all_columns:
+            all_columns.add(col)
 
     combined_rows: list[pd.DataFrame] = []
     for frame in collected_frames:
@@ -491,16 +305,21 @@ def export_excel_bytes(df: pd.DataFrame) -> bytes:
 st.title("🧵 Thread DB Master Builder")
 st.markdown(
     """
-    Build one **Master DB** from Thread DB Excel files. Use either:
-    - **Local folder mode**: point the app at a folder on this machine
-    - **Upload folder**: select a folder directly — works on **Streamlit Cloud**
-    - **Upload ZIP**: upload a ZIP of your folder tree
-    - **Upload files**: upload Excel files directly
+    Select your **Thread DB Forecast** root folder. The app will scan all nested Excel files
+    inside sub-folders such as **FA26**, **HO26**, **SP27**, and **SU27**, read the
+    **Thread_DB** sheet (and any other sheets), normalize the columns, and combine everything
+    into a single **Master DB** Excel file.
     """
 )
 
 with st.sidebar:
     st.header("⚙️ Settings")
+    default_root = str(Path.cwd())
+    main_folder = st.text_input(
+        "Main folder path",
+        value=default_root,
+        help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
+    )
     today_str = datetime.now().strftime("%Y-%m-%d")
     output_name = st.text_input(
         "Output Excel file name",
@@ -512,45 +331,7 @@ with st.sidebar:
         value=str(Path.cwd()),
         help="Full path where the master Excel file will be written.",
     )
-    st.divider()
-    st.subheader("Input mode")
-    input_mode = st.radio(
-        "Source",
-        options=["Local folder", "Upload folder", "Upload ZIP", "Upload files"],
-        help="Choose Local folder for desktop, Upload folder to select a folder directly, Upload ZIP to upload a zipped folder, or Upload files for direct Excel uploads.",
-    )
-    main_folder = ""
-    uploaded_files = []
-    folder_files: List[st.runtime.uploaded_file_manager.UploadedFile] = []
-    zip_file = None
-    if input_mode == "Local folder":
-        default_root = str(Path.cwd())
-        main_folder = st.text_input(
-            "Main folder path",
-            value=default_root,
-            help="Path to the folder that contains FA26, HO26, SP27, SU27, etc.",
-        )
-    elif input_mode == "Upload folder":
-        st.info("Select all Excel files in your Thread DB folder using the picker below. On Windows you can select multiple files with Ctrl+Click or Ctrl+A.")
-        folder_files = st.file_uploader(
-            "Upload folder files",
-            type=["xlsx", "xlsm", "xls"],
-            accept_multiple_files=True,
-            help="Select all Excel files in your Thread DB folder.",
-        )
-    elif input_mode == "Upload ZIP":
-        zip_file = st.file_uploader(
-            "Upload folder ZIP",
-            type=["zip"],
-            help="Zip your Thread DB folder and upload it here.",
-        )
-    else:
-        uploaded_files = st.file_uploader(
-            "Upload Excel files",
-            type=["xlsx", "xlsm", "xls"],
-            accept_multiple_files=True,
-            help="Upload one or more Thread DB Excel files.",
-        )
+    process_button = st.button("🚀 Create master DB", use_container_width=True, type="primary")
 
     st.divider()
     st.markdown(
@@ -565,167 +346,7 @@ with st.sidebar:
         """
     )
 
-if input_mode == "Upload folder":
-    if folder_files:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        def update_progress(message: str, current: int, total: int) -> None:
-            status_text.text(message)
-            if total:
-                progress_bar.progress(min(1.0, current / total))
-
-        master_db, metadata_log = build_master_db_from_files(folder_files, progress_callback=update_progress)
-
-        progress_bar.progress(1.0)
-        status_text.text("Completed.")
-
-        if master_db.empty:
-            st.info("No usable rows were found.")
-            st.subheader("Processing details")
-            st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
-        else:
-            output_path = Path(output_folder).expanduser() / output_name
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            master_db.to_excel(output_path, index=False)
-
-            st.success(f"Master DB generated with {len(master_db)} rows.")
-            st.success(f"Saved to: `{output_path}`")
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Rows", len(master_db))
-            col2.metric("Columns", len(master_db.columns))
-            col3.metric(
-                "Workbook files scanned",
-                len([entry for entry in metadata_log if entry.get("status") == "ok"]),
-            )
-
-            st.subheader("Master database preview")
-            st.dataframe(master_db.head(200), use_container_width=True)
-
-            st.subheader("Processing summary")
-            summary_df = pd.DataFrame(metadata_log)
-            st.dataframe(summary_df, use_container_width=True)
-
-            with open(output_path, "rb") as fh:
-                file_bytes = fh.read()
-            st.download_button(
-                label="📥 Download master Excel",
-                data=file_bytes,
-                file_name=output_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    else:
-        st.info("Please select Excel files to upload.")
-elif input_mode == "Upload ZIP":
-    if zip_file is not None:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        def update_progress(message: str, current: int, total: int) -> None:
-            status_text.text(message)
-            if total:
-                progress_bar.progress(min(1.0, current / total))
-
-        master_db, metadata_log = build_master_db_from_zip(zip_file, progress_callback=update_progress)
-
-        progress_bar.progress(1.0)
-        status_text.text("Completed.")
-
-        if master_db.empty:
-            st.info("No usable rows were found.")
-            st.subheader("Processing details")
-            st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
-        else:
-            output_path = Path(output_folder).expanduser() / output_name
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            master_db.to_excel(output_path, index=False)
-
-            st.success(f"Master DB generated with {len(master_db)} rows.")
-            st.success(f"Saved to: `{output_path}`")
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Rows", len(master_db))
-            col2.metric("Columns", len(master_db.columns))
-            col3.metric(
-                "Workbook files scanned",
-                len([entry for entry in metadata_log if entry.get("status") == "ok"]),
-            )
-
-            st.subheader("Master database preview")
-            st.dataframe(master_db.head(200), use_container_width=True)
-
-            st.subheader("Processing summary")
-            summary_df = pd.DataFrame(metadata_log)
-            st.dataframe(summary_df, use_container_width=True)
-
-            with open(output_path, "rb") as fh:
-                file_bytes = fh.read()
-            st.download_button(
-                label="📥 Download master Excel",
-                data=file_bytes,
-                file_name=output_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    else:
-        st.info("Please upload a ZIP file.")
-elif input_mode == "Upload files":
-    if uploaded_files:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        def update_progress(message: str, current: int, total: int) -> None:
-            status_text.text(message)
-            if total:
-                progress_bar.progress(min(1.0, current / total))
-
-        master_db, metadata_log = build_master_db_from_files(uploaded_files, progress_callback=update_progress)
-
-        progress_bar.progress(1.0)
-        status_text.text("Completed.")
-
-        if master_db.empty:
-            st.info("No usable rows were found.")
-            st.subheader("Processing details")
-            st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
-        else:
-            output_path = Path(output_folder).expanduser() / output_name
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            master_db.to_excel(output_path, index=False)
-
-            st.success(f"Master DB generated with {len(master_db)} rows.")
-            st.success(f"Saved to: `{output_path}`")
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Rows", len(master_db))
-            col2.metric("Columns", len(master_db.columns))
-            col3.metric(
-                "Workbook files scanned",
-                len([entry for entry in metadata_log if entry.get("status") == "ok"]),
-            )
-
-            st.subheader("Master database preview")
-            st.dataframe(master_db.head(200), use_container_width=True)
-
-            st.subheader("Processing summary")
-            summary_df = pd.DataFrame(metadata_log)
-            st.dataframe(summary_df, use_container_width=True)
-
-            with open(output_path, "rb") as fh:
-                file_bytes = fh.read()
-            st.download_button(
-                label="📥 Download master Excel",
-                data=file_bytes,
-                file_name=output_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    else:
-        st.info("Please select Excel files to upload.")
-elif input_mode == "Local folder" and st.button("🚀 Create master DB", use_container_width=True, type="primary"):
-    if not main_folder:
-        st.error("Please enter a main folder path.")
-        st.stop()
-
+if process_button:
     try:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -745,7 +366,7 @@ elif input_mode == "Local folder" and st.button("🚀 Create master DB", use_con
     st.success("Master workbook generated successfully.")
 
     if master_db.empty:
-        st.info("No usable rows were found.")
+        st.info("No usable rows were found in the selected folder.")
         st.subheader("Processing details")
         st.dataframe(pd.DataFrame(metadata_log), use_container_width=True)
         st.stop()
@@ -779,3 +400,5 @@ elif input_mode == "Local folder" and st.button("🚀 Create master DB", use_con
         file_name=output_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+else:
+    st.info("👈 Choose the main folder in the sidebar and click **Create master DB** to get started.")
